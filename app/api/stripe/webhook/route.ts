@@ -4,69 +4,91 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-// Stripe (no apiVersion to avoid TS mismatch)
+// ✅ Stripe (no forces apiVersion to avoid TS mismatch in some stripe versions)
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
 
-// Supabase (admin)
+// ✅ Supabase (admin)
 const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
+// Helpers to safely extract IDs
+function getId(value: unknown): string | null {
+  if (!value) return null;
+  if (typeof value === "string") return value;
+  if (typeof value === "object" && value !== null && "id" in value) {
+    const id = (value as any).id;
+    return typeof id === "string" ? id : null;
+  }
+  return null;
+}
+
 export async function POST(req: NextRequest) {
   const sig = req.headers.get("stripe-signature");
-
   if (!sig) {
-    return NextResponse.json({ error: "Missing Stripe signature" }, { status: 400 });
+    return NextResponse.json(
+      { error: "Missing Stripe signature" },
+      { status: 400 }
+    );
   }
 
   let event: Stripe.Event;
 
   try {
-    const body = await req.text();
+    const body = await req.text(); // raw body for webhook signature
     event = stripe.webhooks.constructEvent(
       body,
       sig,
       process.env.STRIPE_WEBHOOK_SECRET!
     );
   } catch (err: any) {
-    return NextResponse.json({ error: `Webhook error: ${err.message}` }, { status: 400 });
+    return NextResponse.json(
+      { error: `Webhook error: ${err.message}` },
+      { status: 400 }
+    );
   }
 
   try {
-    // ✅ CHECKOUT COMPLETED (initial purchase)
+    // ✅ 1) CHECKOUT COMPLETED
     if (event.type === "checkout.session.completed") {
       const session = event.data.object as Stripe.Checkout.Session;
 
-      const userId = session.client_reference_id;
-      const customerId = session.customer as string | null;
-      const subscriptionId = session.subscription as string | null;
+      const userId =
+        session.client_reference_id ||
+        (session.metadata?.user_id ?? null);
 
       if (!userId) {
-        return NextResponse.json({ error: "Missing user ID" }, { status: 400 });
+        return NextResponse.json(
+          { error: "Missing user ID (client_reference_id or metadata.user_id)" },
+          { status: 400 }
+        );
       }
+
+      const customerId = getId(session.customer);
+      const subscriptionId = getId(session.subscription);
 
       let subscription: Stripe.Subscription | null = null;
 
       if (subscriptionId) {
-        subscription = (await stripe.subscriptions.retrieve(subscriptionId)) as Stripe.Subscription;
+        subscription = await stripe.subscriptions.retrieve(subscriptionId);
       }
 
-      const priceId =
-        subscription?.items?.data?.[0]?.price?.id ?? null;
-
+      const priceId = subscription?.items?.data?.[0]?.price?.id ?? null;
       const status = subscription?.status ?? "active";
 
-      // ✅ FIX: some Stripe typings don't expose these fields -> safely read from runtime
+      // These timestamps exist at runtime; typing differs across SDK versions
       const subAny = subscription as any;
 
-      const periodStart = subAny?.current_period_start
-        ? new Date(subAny.current_period_start * 1000).toISOString()
-        : null;
+      const periodStart =
+        subAny?.current_period_start
+          ? new Date(subAny.current_period_start * 1000).toISOString()
+          : null;
 
-      const periodEnd = subAny?.current_period_end
-        ? new Date(subAny.current_period_end * 1000).toISOString()
-        : null;
+      const periodEnd =
+        subAny?.current_period_end
+          ? new Date(subAny.current_period_end * 1000).toISOString()
+          : null;
 
       await supabase.from("subscriptions").upsert(
         {
@@ -75,7 +97,7 @@ export async function POST(req: NextRequest) {
           stripe_subscription_id: subscriptionId,
           stripe_price_id: priceId,
           status,
-          plan_type: "quarterly", // you can map this later from priceId
+          plan_type: "quarterly", // (si quieres, luego lo hacemos dinámico por priceId)
           current_period_start: periodStart,
           current_period_end: periodEnd,
           metadata: { source: "stripe" },
@@ -84,12 +106,15 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ✅ INVOICE PAID (renewals)
+    // ✅ 2) INVOICE PAID
     if (event.type === "invoice.payment_succeeded") {
       const invoice = event.data.object as Stripe.Invoice;
 
-      const customerId = invoice.customer as string | null;
-      const subscriptionId = invoice.subscription as string | null;
+      const customerId = getId(invoice.customer);
+
+      // TS sometimes doesn't include invoice.subscription depending on version/types
+      const invAny = invoice as any;
+      const subscriptionId = getId(invAny.subscription);
 
       if (!customerId || !subscriptionId) {
         return NextResponse.json({ success: true });
@@ -121,3 +146,4 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
+
